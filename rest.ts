@@ -29,6 +29,8 @@ export interface Ctx {
 export interface Reply {
   status: number;
   body?: unknown;
+  /** Pre-serialized JSON body; when present the app sends these bytes verbatim. */
+  raw?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -75,16 +77,22 @@ function paginate<T>(items: T[], ctx: Ctx, basePath: string): Reply {
 // ---------------------------------------------------------------------------
 // Serializers (shared with the MCP tools so the surfaces agree byte-for-byte)
 
+/**
+ * The viewer's JSON shape is a constant of the deployment (one user, fixed
+ * fields), so it is built once and shared; serializers only ever read it.
+ */
+const USER_JSON: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  node_id: userGid(VIEWER.login),
+  type: 'User',
+  site_admin: false,
+  name: VIEWER.name,
+  email: VIEWER.email,
+};
+
 export function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    node_id: userGid(VIEWER.login),
-    type: 'User',
-    site_admin: false,
-    name: VIEWER.name,
-    email: VIEWER.email,
-  };
+  return USER_JSON;
 }
 
 export function repoJson(repo: RepoRec): Record<string, unknown> {
@@ -163,6 +171,28 @@ export function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknow
     comments_url: '',
     events_url: '',
   };
+}
+
+/**
+ * Serialized GET-issue replies, memoized per issue record. The cache key is
+ * the pair (updatedAt, comment count): every mutation an issue can undergo —
+ * REST PATCH, a GraphQL close, a new comment — either stamps a fresh
+ * updatedAt (the logical clock ticks on every write) or grows the comment
+ * list, and title/body/state/labels/closedAt are only ever written together
+ * with that updatedAt stamp. The remaining serializer inputs cannot change
+ * for an existing issue either: it belongs to one repo for life, and label
+ * records are never edited or deleted once created.
+ */
+const issueBodyCache = new WeakMap<IssueRec, { updatedAt: string; comments: number; raw: Buffer }>();
+
+function issueGetReply(repo: RepoRec, issue: IssueRec): Reply {
+  const cached = issueBodyCache.get(issue);
+  if (cached !== undefined && cached.updatedAt === issue.updatedAt && cached.comments === issue.comments.length) {
+    return { status: 200, raw: cached.raw };
+  }
+  const raw = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issueBodyCache.set(issue, { updatedAt: issue.updatedAt, comments: issue.comments.length, raw });
+  return { status: 200, raw };
 }
 
 export function commentJson(repo: RepoRec, comment: { id: number; body: string; createdAt: string; updatedAt: string }): Record<string, unknown> {
@@ -558,7 +588,7 @@ function routeIssues(repo: RepoRec, tail: string[], ctx: Ctx): Reply {
   const pullTarget = Number.isInteger(number) ? repo.pulls.get(number) : undefined;
   if (tail.length === 1) {
     if (issue === undefined) return notFound();
-    if (ctx.method === 'GET') return { status: 200, body: issueJson(repo, issue) };
+    if (ctx.method === 'GET') return issueGetReply(repo, issue);
     if (ctx.method === 'PATCH') {
       if (ctx.jsonError) return badJson();
       const body = bodyObject(ctx);

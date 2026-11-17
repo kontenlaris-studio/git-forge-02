@@ -20,7 +20,9 @@ export function sha1Hex(data: Buffer): string {
 /** Hash and store an object; returns its object id. */
 export function putObject(store: ObjectStore, type: GitObj['type'], data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  const oid = sha1Hex(Buffer.concat([header, data]));
+  // Feed the hasher the header and the body as two writes: concatenating them
+  // first would copy every object stored, only to hash the copy once.
+  const oid = createHash('sha1').update(header).update(data).digest('hex');
   if (!store.has(oid)) store.set(oid, { type, data });
   return oid;
 }
@@ -119,7 +121,22 @@ export interface CommitRec {
   message: string;
 }
 
+/**
+ * Parsed commits are memoized by buffer identity: a stored object's bytes never
+ * change, and the object store hands out the same Buffer for a given object, so a
+ * parse paid once is never paid again. Callers only ever read the result.
+ */
+const commitParseCache = new WeakMap<Buffer, CommitRec>();
+
 export function parseCommit(data: Buffer): CommitRec {
+  const cached = commitParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseCommitBytes(data);
+  commitParseCache.set(data, parsed);
+  return parsed;
+}
+
+function parseCommitBytes(data: Buffer): CommitRec {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split === -1 ? text : text.slice(0, split);
@@ -163,7 +180,17 @@ export interface TagRec {
   tag: string;
 }
 
+const tagParseCache = new WeakMap<Buffer, TagRec>();
+
 export function parseTag(data: Buffer): TagRec {
+  const cached = tagParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseTagBytes(data);
+  tagParseCache.set(data, parsed);
+  return parsed;
+}
+
+function parseTagBytes(data: Buffer): TagRec {
   const text = data.toString('utf8');
   let object = '';
   let type = '';
@@ -201,8 +228,10 @@ export function commitAncestors(store: ObjectStore, start: string): string[] {
   const seen = new Set<string>();
   const order: string[] = [];
   const queue: string[] = [start];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head];
+    head += 1;
     if (seen.has(oid)) continue;
     const obj = store.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
@@ -213,9 +242,28 @@ export function commitAncestors(store: ObjectStore, start: string): string[] {
   return order;
 }
 
+/**
+ * Ancestry test with an early exit: the walk stops the moment the ancestor is
+ * reached instead of enumerating the whole history. On a fast-forward push the
+ * ancestor is the new commit's parent, so this is a step or two, not a traversal
+ * of every commit the repository has ever taken.
+ */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(store, descendant).includes(ancestor);
+  const seen = new Set<string>();
+  const stack: string[] = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (oid === ancestor) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = store.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) {
+      if (!seen.has(parent)) stack.push(parent);
+    }
+  }
+  return false;
 }
 
 /** Nearest common ancestor of two commits, or null when histories are disjoint. */
@@ -487,9 +535,9 @@ export function readPack(store: ObjectStore, pack: Buffer): Map<string, GitObj> 
 
   for (const entry of entries) {
     const obj = resolveEntry(entry);
-    putObject(store, obj.type, obj.data);
-    const header = Buffer.from(`${obj.type} ${obj.data.length}\0`, 'utf8');
-    resolved.set(sha1Hex(Buffer.concat([header, obj.data])), obj);
+    // putObject already computed this object's id; hashing it a second time here
+    // would just repeat the same SHA-1 over the same bytes.
+    resolved.set(putObject(store, obj.type, obj.data), obj);
   }
   return resolved;
 }

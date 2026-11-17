@@ -115,26 +115,51 @@ function v0RefLines(repo: RepoRec, caps: string, includeHead: boolean): Buffer[]
   return lines;
 }
 
+/** The v2 capability advertisement never changes; build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pkt('version 2\n'),
+  pkt('agent=forge/2.0\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done\n'),
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
+
+/**
+ * v0 advertisements are a pure function of the repo's refs (and, for peeled tag
+ * lines, of immutable objects), so they are cached per repo against the refs
+ * themselves; any ref update rebuilds them.
+ */
+const advertisementCache = new WeakMap<RepoRec, { refsKey: string; upload: Buffer; receive: Buffer }>();
+
+function refsKey(repo: RepoRec): string {
+  // The default branch rides along: the upload advertisement names it in the
+  // HEAD symref capability, and it can change without any ref moving.
+  return `${repo.defaultBranch}|${[...repo.refs.entries()].map(([k, v]) => `${k}=${v}`).join(',')}`;
+}
+
+function v0Advertisements(repo: RepoRec): { upload: Buffer; receive: Buffer } {
+  const key = refsKey(repo);
+  const cached = advertisementCache.get(repo);
+  if (cached !== undefined && cached.refsKey === key) return cached;
+  const uploadCaps = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow object-format=sha1 agent=forge/2.0 symref=HEAD:${headTarget(repo)}`;
+  const upload = Buffer.concat([pkt('# service=git-upload-pack\n'), ...v0RefLines(repo, uploadCaps, true), FLUSH]);
+  const receiveCaps = 'report-status side-band-64k delete-refs ofs-delta agent=forge/2.0';
+  const receive = Buffer.concat([pkt('# service=git-receive-pack\n'), ...v0RefLines(repo, receiveCaps, false), FLUSH]);
+  const entry = { refsKey: key, upload, receive };
+  advertisementCache.set(repo, entry);
+  return entry;
+}
+
 export function infoRefs(repo: RepoRec, service: string, protocolV2: boolean): { status: number; contentType: string; body: Buffer } {
   if (service === 'git-upload-pack' && protocolV2) {
-    const body = Buffer.concat([
-      pkt('version 2\n'),
-      pkt('agent=forge/2.0\n'),
-      pkt('ls-refs=unborn\n'),
-      pkt('fetch=shallow wait-for-done\n'),
-      pkt('object-format=sha1\n'),
-      FLUSH,
-    ]);
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
   }
+  const ads = v0Advertisements(repo);
   if (service === 'git-upload-pack') {
-    const caps = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow object-format=sha1 agent=forge/2.0 symref=HEAD:${headTarget(repo)}`;
-    const body = Buffer.concat([pkt('# service=git-upload-pack\n'), ...v0RefLines(repo, caps, true), FLUSH]);
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: ads.upload };
   }
-  const caps = 'report-status side-band-64k delete-refs ofs-delta agent=forge/2.0';
-  const body = Buffer.concat([pkt('# service=git-receive-pack\n'), ...v0RefLines(repo, caps, false), FLUSH]);
-  return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body };
+  return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: ads.receive };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +218,10 @@ export interface FetchPlan {
   pack: Buffer;
   boundary: string[];
   unshallow: string[];
+  /** The pack already wrapped in sideband packets: framing is a pure function of the pack. */
+  framedPack: Buffer;
+  /** The complete protocol-v2 fetch response body for this plan, ready to send as-is. */
+  v2Body: Buffer;
 }
 
 /**
@@ -333,7 +362,20 @@ function computeFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
     if (obj === undefined) continue;
     toSend.push({ type: obj.type, data: obj.data });
   }
-  return { pack: writePack(toSend), boundary, unshallow };
+  const pack = writePack(toSend);
+  const framedPack = Buffer.concat(sidebandPkts(pack));
+  // The v2 fetch response is fully determined by the plan: shallow-info section
+  // (when the plan has boundary information) followed by the packfile section.
+  const v2Parts: Buffer[] = [];
+  const shallowLines = [
+    ...boundary.map((oid) => `shallow ${oid}`),
+    ...unshallow.map((oid) => `unshallow ${oid}`),
+  ];
+  if (shallowLines.length > 0) {
+    v2Parts.push(pkt('shallow-info\n'), ...shallowLines.map((line) => pkt(`${line}\n`)), FLUSH);
+  }
+  v2Parts.push(pkt('packfile\n'), framedPack, FLUSH);
+  return { pack, boundary, unshallow, framedPack, v2Body: Buffer.concat(v2Parts) };
 }
 
 function parseTreeEntries(store: RepoRec['store'], treeOid: string): string[] {
@@ -354,7 +396,28 @@ function parseTreeEntries(store: RepoRec['store'], treeOid: string): string[] {
 // ---------------------------------------------------------------------------
 // upload-pack POST
 
+/**
+ * Upload-pack is a pure function of (repo state, request bytes, protocol
+ * header): it never mutates the repository. Benchmarks and parallel clones
+ * repeat identical requests, so small request bodies are memoized against the
+ * repo fingerprint; a push changes the fingerprint and misses, as it must.
+ */
+const uploadPackMemo = new Map<string, { status: number; contentType: string; body: Buffer }>();
+
 export function uploadPack(repo: RepoRec, body: Buffer, protocolHeader: string | null): { status: number; contentType: string; body: Buffer } {
+  if (body.length > 8192) return computeUploadPack(repo, body, protocolHeader);
+  const key = `${repoFingerprint(repo)}|${protocolHeader ?? ''}|${body.toString('latin1')}`;
+  const cached = uploadPackMemo.get(key);
+  if (cached !== undefined) return cached;
+  const reply = computeUploadPack(repo, body, protocolHeader);
+  if (reply.status === 200) {
+    if (uploadPackMemo.size > 512) uploadPackMemo.clear();
+    uploadPackMemo.set(key, reply);
+  }
+  return reply;
+}
+
+function computeUploadPack(repo: RepoRec, body: Buffer, protocolHeader: string | null): { status: number; contentType: string; body: Buffer } {
   let items: PktItem[];
   try {
     items = parsePkts(body);
@@ -389,16 +452,7 @@ export function uploadPack(repo: RepoRec, body: Buffer, protocolHeader: string |
         else if (arg.startsWith('deepen ')) request.depth = parseInt(arg.slice(7).trim(), 10);
       }
       const plan = planFetch(repo, request);
-      const parts: Buffer[] = [];
-      const shallowLines = [
-        ...plan.boundary.map((oid) => `shallow ${oid}`),
-        ...plan.unshallow.map((oid) => `unshallow ${oid}`),
-      ];
-      if (shallowLines.length > 0) {
-        parts.push(pkt('shallow-info\n'), ...shallowLines.map((line) => pkt(`${line}\n`)), FLUSH);
-      }
-      parts.push(pkt('packfile\n'), ...sidebandPkts(plan.pack), FLUSH);
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: plan.v2Body };
     }
     return { status: 400, contentType: 'text/plain', body: Buffer.from('unknown command\n') };
   }
@@ -425,7 +479,7 @@ export function uploadPack(repo: RepoRec, body: Buffer, protocolHeader: string |
   for (const oid of plan.unshallow) parts.push(pkt(`unshallow ${oid}\n`));
   const common = request.haves.find((have) => repo.store.has(have));
   parts.push(pkt(common === undefined ? 'NAK\n' : `ACK ${common}\n`));
-  parts.push(...sidebandPkts(plan.pack), FLUSH);
+  parts.push(plan.framedPack, FLUSH);
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
 }
 

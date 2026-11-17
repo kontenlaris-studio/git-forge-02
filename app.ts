@@ -43,6 +43,17 @@ function sendRaw(res: ServerResponse, status: number, contentType: string, body:
   res.end(body);
 }
 
+/** Send a pre-serialized JSON body (the REST layer's cached replies). */
+function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, extraHeaders: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': nextRequestId(),
+    'content-length': String(body.length),
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
 function decodeSegment(segment: string): string {
   try {
     return decodeURIComponent(segment);
@@ -51,10 +62,60 @@ function decodeSegment(segment: string): string {
   }
 }
 
+const EMPTY_BODY = Buffer.alloc(0);
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);
+}
+
+/**
+ * Split a request target into pathname + query string without the full URL
+ * parser. Exotic targets (non-ASCII bytes, fragments, dot segments) take the
+ * legacy URL path so their handling is byte-for-byte what it always was.
+ */
+function splitTarget(rawUrl: string): { pathname: string; queryString: string } {
+  // (A backslash counts as exotic too: the URL parser treats it as a path
+  // separator for http URLs, the fast path must not disagree.)
+  let exotic = rawUrl.includes('#') || rawUrl.includes('\\');
+  for (let i = 0; !exotic && i < rawUrl.length; i += 1) {
+    const code = rawUrl.charCodeAt(i);
+    if (code < 0x20 || code > 0x7e) exotic = true;
+  }
+  if (!exotic) {
+    // Dot segments are the one place the URL parser rewrites the path itself.
+    for (const part of rawUrl.split('?', 1)[0].split('/')) {
+      if (part === '.' || part === '..') {
+        exotic = true;
+        break;
+      }
+    }
+  }
+  if (exotic) {
+    const url = new URL(rawUrl, 'http://forge.invalid');
+    return { pathname: url.pathname, queryString: url.search === '' ? '' : url.search.slice(1) };
+  }
+  const q = rawUrl.indexOf('?');
+  if (q === -1) return { pathname: rawUrl, queryString: '' };
+  return { pathname: rawUrl.slice(0, q), queryString: rawUrl.slice(q + 1) };
+}
+
+/** Path segments of a pathname, percent-decoded exactly like decodeURIComponent per segment. */
+function splitPath(pathname: string): string[] {
+  const out: string[] = [];
+  for (const part of pathname.split('/')) {
+    if (part === '') continue;
+    out.push(part.includes('%') ? decodeSegment(part) : part);
+  }
+  return out;
+}
+
+/** Whether the request can carry a body worth reading, from its headers alone. */
+function mayHaveBody(req: IncomingMessage): boolean {
+  if (req.headers['transfer-encoding'] !== undefined) return true;
+  const length = req.headers['content-length'];
+  return length !== undefined && length !== '0';
 }
 
 export function createApp(): Server {
@@ -70,16 +131,21 @@ export function createApp(): Server {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://forge.invalid');
-  const segments = url.pathname.split('/').filter((s) => s !== '').map(decodeSegment);
+  const { pathname, queryString } = splitTarget(req.url ?? '/');
+  const segments = splitPath(pathname);
   const method = req.method ?? 'GET';
+  let queryCache: URLSearchParams | null = null;
+  const query = (): URLSearchParams => {
+    if (queryCache === null) queryCache = new URLSearchParams(queryString);
+    return queryCache;
+  };
 
-  if (url.pathname === '/healthz') {
+  if (pathname === '/healthz') {
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  const body = await readBody(req);
+  const body = mayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1].endsWith('.git')) {
@@ -96,7 +162,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     const tail = segments.slice(2);
     if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-      const service = url.searchParams.get('service') ?? '';
+      const service = query().get('service') ?? '';
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, 404, { message: 'Not Found' });
         return;
@@ -139,7 +205,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     const ctx: Ctx = {
       method,
-      query: url.searchParams,
+      query: query(),
       body,
       json,
       jsonError,
@@ -149,6 +215,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (reply.status === 204) {
       res.writeHead(204, { 'x-github-request-id': nextRequestId() });
       res.end();
+      return;
+    }
+    if (reply.raw !== undefined) {
+      sendJsonBuffer(res, reply.status, reply.raw, reply.headers ?? {});
       return;
     }
     sendJson(res, reply.status, reply.body, reply.headers ?? {});
