@@ -11,16 +11,18 @@ import { handleMcp } from './mcp.ts';
 import { infoRefs, receivePack, uploadPack } from './githttp.ts';
 
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+/** The exact Authorization header value every protected surface demands, built once. */
+const EXPECTED_AUTH = EXPECTED_TOKEN === '' ? null : `Bearer ${EXPECTED_TOKEN}`;
 let requestSeq = 0;
 
 function nextRequestId(): string {
   requestSeq += 1;
-  return `forge-${requestSeq.toString(36)}-${Date.now().toString(36)}`;
+  return `forge-${requestSeq}`;
 }
 
 function authorized(req: IncomingMessage): boolean {
-  if (EXPECTED_TOKEN === '') return true;
-  return req.headers.authorization === `Bearer ${EXPECTED_TOKEN}`;
+  if (EXPECTED_AUTH === null) return true;
+  return req.headers.authorization === EXPECTED_AUTH;
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
@@ -85,12 +87,11 @@ function splitTarget(rawUrl: string): { pathname: string; queryString: string } 
   }
   if (!exotic) {
     // Dot segments are the one place the URL parser rewrites the path itself.
-    for (const part of rawUrl.split('?', 1)[0].split('/')) {
-      if (part === '.' || part === '..') {
-        exotic = true;
-        break;
-      }
-    }
+    // A dot segment is always either the target's first segment or preceded by
+    // a '/', so these two probes find every one the split-and-compare scan did.
+    const q = rawUrl.indexOf('?');
+    const pathPart = q === -1 ? rawUrl : rawUrl.slice(0, q);
+    if (pathPart.includes('/.') || pathPart.startsWith('.')) exotic = true;
   }
   if (exotic) {
     const url = new URL(rawUrl, 'http://forge.invalid');
@@ -118,34 +119,77 @@ function mayHaveBody(req: IncomingMessage): boolean {
   return length !== undefined && length !== '0';
 }
 
+/** Shared parameters for the (very common) empty query string; consumers only ever read it. */
+const EMPTY_PARAMS = new URLSearchParams();
+
+/** The 500 a handler failure earns, when the response is still ours to write. */
+function fail(res: ServerResponse): void {
+  try {
+    if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
+    else res.end();
+  } catch {
+    // The socket is already gone; there is no one left to answer.
+  }
+}
+
 export function createApp(): Server {
-  const server = createServer((req, res) => {
-    handle(req, res).catch(() => {
-      if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
-      else res.end();
-    });
+  // noDelay is stated explicitly: the workloads are strict request/response
+  // ping-pong on one socket, where a Nagle/delayed-ACK stall would tax every
+  // single operation; the option costs nothing where it is already the default.
+  const server = createServer({ noDelay: true }, (req, res) => {
+    let pending: Promise<void> | undefined;
+    try {
+      pending = dispatch(req, res);
+    } catch {
+      fail(res);
+      return;
+    }
+    if (pending !== undefined) pending.catch(() => fail(res));
   });
   server.keepAliveTimeout = 75_000;
   server.headersTimeout = 80_000;
   return server;
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/**
+ * Route one request. Requests that cannot carry a body (every GET, and the
+ * benchmark's hot paths are full of them) are routed synchronously: wrapping
+ * them in an async function allocated a promise and a catch chain per request
+ * for an await that never happens. Requests with a body read it first, then
+ * route from the promise continuation, as before.
+ */
+function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> | undefined {
   const { pathname, queryString } = splitTarget(req.url ?? '/');
   const segments = splitPath(pathname);
   const method = req.method ?? 'GET';
   let queryCache: URLSearchParams | null = null;
   const query = (): URLSearchParams => {
-    if (queryCache === null) queryCache = new URLSearchParams(queryString);
+    if (queryCache === null) queryCache = queryString === '' ? EMPTY_PARAMS : new URLSearchParams(queryString);
     return queryCache;
   };
 
   if (pathname === '/healthz') {
     sendJson(res, 200, { ok: true });
-    return;
+    return undefined;
   }
 
-  const body = mayHaveBody(req) ? await readBody(req) : EMPTY_BODY;
+  if (!mayHaveBody(req)) {
+    route(req, res, segments, method, query, EMPTY_BODY);
+    return undefined;
+  }
+  return readBody(req).then((body) => {
+    route(req, res, segments, method, query, body);
+  });
+}
+
+function route(
+  req: IncomingMessage,
+  res: ServerResponse,
+  segments: string[],
+  method: string,
+  query: () => URLSearchParams,
+  body: Buffer,
+): void {
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1].endsWith('.git')) {

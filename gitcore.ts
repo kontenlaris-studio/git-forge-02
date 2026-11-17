@@ -17,9 +17,29 @@ export function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
+/**
+ * Object headers (`"<type> <length>\0"`) repeat constantly — every push stores
+ * another 1 KiB blob under the same header — and they are immutable once built,
+ * so they are memoized by their text. The map stays tiny (four types times the
+ * lengths a workload actually stores); it is cleared if it ever grows past a
+ * generous bound rather than being allowed to accumulate one entry per size.
+ */
+const headerCache = new Map<string, Buffer>();
+
+function objectHeader(type: GitObj['type'], length: number): Buffer {
+  const text = `${type} ${length}`;
+  let header = headerCache.get(text);
+  if (header === undefined) {
+    header = Buffer.from(`${text}\0`, 'utf8');
+    if (headerCache.size > 1024) headerCache.clear();
+    headerCache.set(text, header);
+  }
+  return header;
+}
+
 /** Hash and store an object; returns its object id. */
 export function putObject(store: ObjectStore, type: GitObj['type'], data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
+  const header = objectHeader(type, data.length);
   // Feed the hasher the header and the body as two writes: concatenating them
   // first would copy every object stored, only to hash the copy once.
   const oid = createHash('sha1').update(header).update(data).digest('hex');
@@ -459,6 +479,7 @@ export function readPack(store: ObjectStore, pack: Buffer): Map<string, GitObj> 
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
   const entries: PackEntry[] = [];
+  let sawDelta = false;
   let offset = 12;
   for (let i = 0; i < count; i += 1) {
     const entryOffset = offset;
@@ -474,6 +495,7 @@ export function readPack(store: ObjectStore, pack: Buffer): Map<string, GitObj> 
       shift += 7;
     }
     const entry: PackEntry = { offset: entryOffset, typeCode, data: Buffer.alloc(0) };
+    if (typeCode === 6 || typeCode === 7) sawDelta = true;
     if (typeCode === 6) {
       // OFS_DELTA
       byte = pack[offset];
@@ -497,6 +519,20 @@ export function readPack(store: ObjectStore, pack: Buffer): Map<string, GitObj> 
     entries.push(entry);
   }
   if (offset !== trailerStart) throw new Error('pack length mismatch');
+
+  if (!sawDelta) {
+    // No deltas: every entry already holds its object's full bytes, so the
+    // delta-resolution machinery below (offset index, cycle guard) has nothing
+    // to resolve. Store the objects in pack order, exactly as it would.
+    const resolved = new Map<string, GitObj>();
+    for (const entry of entries) {
+      const type = PACK_TYPES[entry.typeCode];
+      if (type === undefined) throw new Error(`unknown pack type ${entry.typeCode}`);
+      const obj: GitObj = { type, data: entry.data };
+      resolved.set(putObject(store, obj.type, obj.data), obj);
+    }
+    return resolved;
+  }
 
   const byOffset = new Map<number, PackEntry>();
   for (const entry of entries) byOffset.set(entry.offset, entry);

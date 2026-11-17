@@ -20,11 +20,29 @@ export const ZERO = ZERO_OID;
 // ---------------------------------------------------------------------------
 // pkt-lines
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/**
+ * Frame one pkt-line: a 4-digit lowercase hex length (counting the header
+ * itself) followed by the payload. Header and payload are written into a
+ * single fresh buffer — framing sits on every git response path, and the
+ * two-allocations-plus-concat form cost a measurable slice of it. Payloads
+ * too large for a 4-digit length keep the historical construction verbatim.
+ */
 export function pkt(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = body.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, body]);
+  if (length > 0xffff) {
+    const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
+    return Buffer.concat([header, body]);
+  }
+  const out = Buffer.allocUnsafe(length);
+  out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(length & 0xf);
+  body.copy(out, 4);
+  return out;
 }
 export const FLUSH = Buffer.from('0000', 'ascii');
 export const DELIM = Buffer.from('0001', 'ascii');
@@ -40,9 +58,8 @@ export function parsePkts(buffer: Buffer): PktItem[] {
   let pos = 0;
   while (pos < buffer.length) {
     if (pos + 4 > buffer.length) throw new Error('truncated pkt-line');
-    const header = buffer.toString('ascii', pos, pos + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('invalid pkt-line length');
-    const length = parseInt(header, 16);
+    const length = pktLengthAt(buffer, pos);
+    if (length === -1) throw new Error('invalid pkt-line length');
     if (length === 0) {
       items.push({ kind: 'flush', payload: Buffer.alloc(0) });
       pos += 4;
@@ -128,9 +145,12 @@ const V2_ADVERTISEMENT: Buffer = Buffer.concat([
 /**
  * v0 advertisements are a pure function of the repo's refs (and, for peeled tag
  * lines, of immutable objects), so they are cached per repo against the refs
- * themselves; any ref update rebuilds them.
+ * themselves; any ref update rebuilds them. Each service's advertisement is
+ * built only when that service is actually asked for: a push asks for the
+ * receive-pack advertisement on every operation, and building the upload-pack
+ * one as well was pure waste on that path.
  */
-const advertisementCache = new WeakMap<RepoRec, { refsKey: string; upload: Buffer; receive: Buffer }>();
+const advertisementCache = new WeakMap<RepoRec, { refsKey: string; upload?: Buffer; receive?: Buffer }>();
 
 function refsKey(repo: RepoRec): string {
   // The default branch rides along: the upload advertisement names it in the
@@ -138,28 +158,35 @@ function refsKey(repo: RepoRec): string {
   return `${repo.defaultBranch}|${[...repo.refs.entries()].map(([k, v]) => `${k}=${v}`).join(',')}`;
 }
 
-function v0Advertisements(repo: RepoRec): { upload: Buffer; receive: Buffer } {
+function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const key = refsKey(repo);
-  const cached = advertisementCache.get(repo);
-  if (cached !== undefined && cached.refsKey === key) return cached;
-  const uploadCaps = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow object-format=sha1 agent=forge/2.0 symref=HEAD:${headTarget(repo)}`;
-  const upload = Buffer.concat([pkt('# service=git-upload-pack\n'), ...v0RefLines(repo, uploadCaps, true), FLUSH]);
-  const receiveCaps = 'report-status side-band-64k delete-refs ofs-delta agent=forge/2.0';
-  const receive = Buffer.concat([pkt('# service=git-receive-pack\n'), ...v0RefLines(repo, receiveCaps, false), FLUSH]);
-  const entry = { refsKey: key, upload, receive };
-  advertisementCache.set(repo, entry);
-  return entry;
+  let entry = advertisementCache.get(repo);
+  if (entry === undefined || entry.refsKey !== key) {
+    entry = { refsKey: key };
+    advertisementCache.set(repo, entry);
+  }
+  if (service === 'git-upload-pack') {
+    if (entry.upload === undefined) {
+      const caps = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow object-format=sha1 agent=forge/2.0 symref=HEAD:${headTarget(repo)}`;
+      entry.upload = Buffer.concat([pkt('# service=git-upload-pack\n'), ...v0RefLines(repo, caps, true), FLUSH]);
+    }
+    return entry.upload;
+  }
+  if (entry.receive === undefined) {
+    const caps = 'report-status side-band-64k delete-refs ofs-delta agent=forge/2.0';
+    entry.receive = Buffer.concat([pkt('# service=git-receive-pack\n'), ...v0RefLines(repo, caps, false), FLUSH]);
+  }
+  return entry.receive;
 }
 
 export function infoRefs(repo: RepoRec, service: string, protocolV2: boolean): { status: number; contentType: string; body: Buffer } {
   if (service === 'git-upload-pack' && protocolV2) {
     return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
   }
-  const ads = v0Advertisements(repo);
   if (service === 'git-upload-pack') {
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: ads.upload };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v0Advertisement(repo, 'git-upload-pack') };
   }
-  return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: ads.receive };
+  return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: v0Advertisement(repo, 'git-receive-pack') };
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +519,21 @@ export interface RefUpdate {
   ref: string;
 }
 
+/** The 4-digit hex pkt-line length at `pos`, or -1 when any byte is not a hex digit. */
+function pktLengthAt(body: Buffer, pos: number): number {
+  let value = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const code = body[pos + i] as number;
+    let digit: number;
+    if (code >= 0x30 && code <= 0x39) digit = code - 0x30;
+    else if (code >= 0x61 && code <= 0x66) digit = code - 0x61 + 10;
+    else if (code >= 0x41 && code <= 0x46) digit = code - 0x41 + 10;
+    else return -1;
+    value = value * 16 + digit;
+  }
+  return value;
+}
+
 export function receivePack(repo: RepoRec, body: Buffer): { status: number; contentType: string; body: Buffer } {
   // Split the command list (pkt-lines up to the first flush) from the pack that follows.
   let pos = 0;
@@ -500,9 +542,8 @@ export function receivePack(repo: RepoRec, body: Buffer): { status: number; cont
   try {
     for (;;) {
       if (pos + 4 > body.length) throw new Error('truncated');
-      const header = body.toString('ascii', pos, pos + 4);
-      if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('invalid pkt-line');
-      const length = parseInt(header, 16);
+      const length = pktLengthAt(body, pos);
+      if (length === -1) throw new Error('invalid pkt-line');
       if (length === 0) {
         pos += 4;
         break;

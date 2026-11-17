@@ -134,6 +134,98 @@ per-workload formula (points = 25 − 12.5·log2(t/T_ref)) gives roughly
 p50 ≈ 455 µs. Better than 928, still probably short of the 947 cut — the
 remaining gap is platform latency a TypeScript entry cannot remove.
 
+### Perf round 3 — chasing the last 10 points (17 Nov 2026, later still)
+
+Round 2's resubmission graded **937** on the server (perf 137, p50 484 µs,
+rank 786) against a top-60 cut of **947** (perf 147, p50 ≈ 426 µs). This round
+attacked what the in-process profile said was left, speed only, zero behavior
+change. The measurement problem got harder, not easier: the effects are now
+the same size as this VM's CPU-throttling drift, so the A/B ran 17 interleaved
+suite pairs against a pristine `git archive HEAD` baseline — and the first 11
+pairs turned out to be order-biased (baseline always ran first while the VM
+progressively throttled; the candidate, always second, ate the drift). The
+last 6 pairs alternated order with 25 s cool-downs between runs; that subset
+is the unbiased estimate, and the full pool is quoted only for completeness.
+
+In-process costs (same VM, indicative — these are the costs the changes
+mechanically remove):
+
+| function | before | after | Δ |
+|----------|--------|-------|---|
+| receivePack (full, chained) | 101.5 µs | 78.7 µs | **−22%** |
+| readPack (3-object pack) | 68.9 µs | 57.2 µs | −17% |
+| infoRefs receive (rebuild) | 17.3 µs | 8.0 µs | **−54%** |
+| report build (pkt + sideband) | 7.0 µs | 4.5 µs | −35% |
+| routeRest GET issue | 1.0 µs | 1.0 µs | — |
+
+Suite A/B, per-workload p50 medians of run medians:
+
+| workload | full pool (17 pairs) | alternating subset (6 pairs) |
+|----------|---------------------|------------------------------|
+| push | −4.2% | **−6.0%** |
+| clone | −1.4% | −3.4% |
+| read | +0.8% | −7.0% |
+| write | +2.0% | +0.5% |
+| geomean | −0.7% | **−4.0%** |
+
+What changed:
+- **gitcore**: `putObject` memoizes object headers by `"<type> <length>"`
+  (every push stores another 1 KiB blob under the same header; headers are
+  immutable). `readPack` gained a no-delta fast path: when a pack contains no
+  OFS/REF delta entries — every pack the suite's client sends — the entries
+  already hold their objects' full bytes, so the offset index and cycle guard
+  are skipped and objects are stored in pack order, exactly as the general
+  path resolves them. Delta packs take the original path untouched.
+- **githttp**: `pkt()` frames into a single allocated buffer (4 hex digits
+  written directly, payload copied once) instead of building a header buffer
+  and concatenating; oversized payloads keep the historical construction.
+  The v0 advertisement cache is per-service now: a receive-pack advertisement
+  request no longer also builds the upload-pack advertisement (refs move on
+  every push, so this rebuild is on the push hot path). Pkt-line lengths in
+  `receivePack`/`parsePkts` are parsed by a manual hex decoder with the same
+  accept/reject semantics as the regex + `parseInt` it replaces.
+- **app**: requests that cannot carry a body are routed synchronously — the
+  async wrapper allocated a promise and a catch chain per GET for an await
+  that never happens; requests with bodies read first, then route, as before,
+  with identical error-to-500 handling. The request id is a plain counter
+  (was two radix-36 conversions plus `Date.now()` per response; the protocol
+  check only requires a non-empty value). The expected `Authorization` value
+  is precomputed once. An empty query string reuses one shared
+  `URLSearchParams` (every consumer only reads it). `splitTarget`'s
+  dot-segment detection probes for `/.`/a leading `.` instead of splitting
+  the target into arrays. `noDelay` is set explicitly on the server (the
+  workloads are strict request/response ping-pong; the option is free where
+  it is already the default).
+
+Tried and rejected:
+- **Cheaper zlib stream-end discovery.** `inflateSync(..., {info:true})` is
+  ~76% of readPack's cost and carries a premium over the plain call, but it
+  is the only API that reports a deflate stream's consumed length, which the
+  next entry's offset depends on. `inflateRawSync` past a manual zlib-header
+  skip looked cheaper in one noisy run and silently drops adler32 validation
+  — rejected on correctness grounds; pack acceptance semantics are unchanged.
+- **Trailer verification in readPack** (the current code never checks the
+  pack SHA-1): adding it would change which packs are accepted. Not a speed
+  change; left alone.
+- **Raw socket response writes** (bypassing `writeHead`): the keep-alive
+  request/response pairing bookkeeping is Node's; the risk buys nothing the
+  profile can see.
+- The write path remains what round 2 found: fresh JSON in, fresh JSON out,
+  Node HTTP machinery as the floor. No honest win found there in two rounds.
+
+Verification: 26 full-suite runs of the final code across the A/B batches and
+three closing runs — **feature 120/120 and MCP 15/15 in every one** — and the
+`main.ts` lifecycle (register → /healthz → /done → exit 0) re-verified
+against a fake env.
+
+Server projection (honest): applying the alternating-subset ratios to the
+official formula gives roughly +3 perf points (push ≈ +1.2, clone ≈ +0.7,
+read ≈ +1.4, write ≈ 0) → **perf ≈ 140, total ≈ 940**; the contaminated
+full-pool ratios give ≈ 938–939. Either way this most likely still lands
+short of the 947 cut: what remains is the bench client's own per-request
+cost and gVisor platform latency, which no entry code can remove. The wins
+are real but they are the last ones this architecture has.
+
 ### Lifecycle verification (17 Nov 2026)
 - `main.ts` run against a fake env ($MAKEFUN_ENV_URL): bound ephemeral port 42063,
   POST /register received, /healthz → {"ok":true}, /api/v3/meta answered, /done polled
