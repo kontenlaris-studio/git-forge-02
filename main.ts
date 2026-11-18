@@ -2,9 +2,12 @@
 // entirely from outside: it tells us where it lives through $MAKEFUN_ENV_URL,
 // we bring the HTTP server up on whichever port the kernel picks, report that
 // port back, and idle until the harness says the run is finished — only then
-// do we close the server and exit successfully.
+// do we close the server and exit successfully. The server itself is the raw
+// TCP listener from app.ts (which speaks HTTP/1.1 itself, for speed); the
+// surface this file needs from it is just listen/address/close, so the type
+// below is node:net's Server, not node:http's.
 
-import type { Server } from 'node:http';
+import type { Server } from 'node:net';
 import { createApp } from './app.ts';
 
 // Timing knobs for talking to the harness, gathered in one place so the

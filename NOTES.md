@@ -226,6 +226,54 @@ short of the 947 cut: what remains is the bench client's own per-request
 cost and gVisor platform latency, which no entry code can remove. The wins
 are real but they are the last ones this architecture has.
 
+### Perf round 4 — replace the transport (18 Nov 2026)
+
+Rounds 2–3 concluded the residual cost was Node's HTTP machinery, then stopped
+at tweaking around it. This round removed it: **app.ts no longer uses
+node:http**. The server speaks HTTP/1.1 itself on a raw `node:net` socket —
+per-connection buffer, a hand parser for the request head (the same manual
+hex discipline as pkt-lines; chunked bodies and 100-continue included), and
+one serialized write per answer. The routing layer already produced fully
+buffered replies on every surface, so `route()` became `dispatch()`: same
+decisions, same status/header/body bytes (status phrases from STATUS_CODES;
+node's automatic Date/Connection are gone — no client reads them), returning
+a value instead of writing to a ServerResponse. HEAD answers drop the body,
+keep-alive follows the 1.1/1.0 rules, an unparseable head earns the 400-and-
+close node:http gave, idle sockets time out at 75 s. main.ts changed only in
+its Server type (node:net's — listen/address/close are the whole surface it
+uses) and its comments. Verified outside the suite too: chunked POST → 201,
+Expect: 100-continue → 201, HEAD → headers only, Connection: close honoured,
+garbage bytes → 400 and the server lives; the lifecycle (register → /healthz
+→ /done → exit 0) re-verified against a fake env.
+
+Measurement on this VM is worse than in rounds 2–3 — identical baseline code
+scored local perf 120…200 across one afternoon (neighbour throttling), so
+single runs prove nothing and even suite pairs wobble. Two instruments:
+(i) 6 interleaved suite A/B pairs vs `git archive HEAD`, alternating order,
+20 s cool-downs — pair-median ratios (candidate/baseline): push ≈ 0.75,
+clone ≈ 0.88, read ≈ 0.97, write ≈ 1.07 (the two sequential REST workloads
+are the most drift-corrupted: their pair ratios swing 0.5–1.5 on identical
+code); (ii) a fine-grained interleaved micro-A/B for exactly those two —
+both servers up at once, one kit RestClient each, blocks of 200 GETs /
+50 POSTs alternating sides so drift is common-mode: **read 0.921**
+(block medians 208.3 → 192.0 ms), **write 0.838** (104.3 → 87.4 ms).
+Push's suite signal is consistent in every low-drift pair (−22…−28%): it
+pays the transport tax twice per op (advertisement + receive-pack) on top of
+real pack work, so it gains the most. Best estimates: push 0.75, clone 0.88,
+read 0.92, write ≈ 0.87 → geomean ≈ 0.85 (−15%).
+
+Feature stayed **120/120** and MCP **15/15** in all 14 candidate suite runs
+(the 12 A/B runs plus two closing runs).
+
+Server projection (honest): full transfer of the ratios to the official
+934 (perf 134, geomean p50 502 µs) gives per-workload +5.2/+2.3/+1.5/+2.5 →
+**perf ≈ 145, total ≈ 945, geomean ≈ 428 µs** — on the 947 cut line, not
+clearly over it. Rounds 2–3 both over-projected by 3–6 points, so the
+haircut estimate is **total ≈ 940–943**. Either way it is strictly better
+than the counted 934, and it is a structural change (a whole layer removed),
+not another noise-level tweak; what remains after it is the bench client's
+own per-request cost and platform latency, which no entry code can remove.
+
 ### Lifecycle verification (17 Nov 2026)
 - `main.ts` run against a fake env ($MAKEFUN_ENV_URL): bound ephemeral port 42063,
   POST /register received, /healthz → {"ok":true}, /api/v3/meta answered, /done polled
