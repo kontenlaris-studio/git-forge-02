@@ -56,3 +56,7 @@ This project is published as a security-scanned skill with a hosted app on Skill
 
 - **App:** [Git Forge Guide](https://git-forge-guide.skillsafe.ai)
 - **Skill (installable):** https://skillsafe.ai/share/shr_pa5dn4m2eh65
+
+## License this engine
+
+The **Git Forge** is available under a perpetual commercial license (Indie $149 / Commercial $449 / Studio $1,199) for use in your own products: [catalog & terms](https://kontenlaris-studio.github.io/engine-licensing/) · order via kontenlaris.studio@gmail.com.
